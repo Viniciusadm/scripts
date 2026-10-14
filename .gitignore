@@ -1,0 +1,5 @@
+past.py
+turn-off
+__pycache__/
+node_modules/
+.env

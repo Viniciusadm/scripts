@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+import argparse
+import errno
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+BLOCK_SIZE = 4 * 1024 * 1024
+RENAME_FALLBACK_ERRORS = {
+    errno.EXDEV,
+    errno.ENOSYS,
+    errno.EPERM,
+    errno.EINVAL,
+    errno.EOPNOTSUPP,
+}
+FRAME_INTERVAL = 0.1
+SPEED_WINDOW = 5.0
+
+
+class Move:
+    def __init__(self, source, target, size):
+        self.source = source
+        self.target = target
+        self.size = size
+
+
+class Failure:
+    def __init__(self, move, reason):
+        self.move = move
+        self.reason = reason
+
+
+def natural_key(text):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", text)
+    ]
+
+
+def human_bytes(value):
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+
+
+def human_time(seconds):
+    if seconds is None or seconds != seconds or seconds in (float("inf"), 0):
+        return "--:--"
+    seconds = int(seconds)
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def shorten(text, width):
+    if len(text) <= width:
+        return text.ljust(width)
+    return text[: width - 1] + "…"
+
+
+def entry_size(path):
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def collect_from_directory(root, destination):
+    moves = []
+    for current, directories, files in os.walk(root):
+        directories.sort(key=natural_key)
+        current_path = Path(current)
+        if current_path.resolve() == destination:
+            directories[:] = []
+            continue
+        for name in sorted(files, key=natural_key):
+            source = current_path / name
+            if source.is_symlink() and not source.exists():
+                continue
+            relative = source.relative_to(root)
+            moves.append(Move(source, destination / relative, entry_size(source)))
+    return moves
+
+
+def build_queue(sources, destination):
+    moves = []
+    for source in sources:
+        if source.is_dir() and not source.is_symlink():
+            moves.extend(collect_from_directory(source, destination))
+        elif source.exists() or source.is_symlink():
+            moves.append(Move(source, destination / source.name, entry_size(source)))
+        else:
+            raise SystemExit(f"qmv: origem inexistente: {source}")
+    moves.sort(key=lambda move: natural_key(str(move.source)))
+    seen = {}
+    for move in moves:
+        previous = seen.get(move.target)
+        if previous is not None:
+            raise SystemExit(
+                f"qmv: alvo duplicado {move.target}\n  de {previous}\n  de {move.source}"
+            )
+        seen[move.target] = move.source
+    return moves
+
+
+def resolve_sources(raw_sources, destination):
+    resolved = []
+    for raw in raw_sources:
+        path = Path(raw)
+        if path.resolve() == destination:
+            raise SystemExit("qmv: origem e destino são o mesmo diretório")
+        resolved.append(path)
+    return resolved
+
+
+class Progress:
+    def __init__(self, moves, workers):
+        self.total_files = len(moves)
+        self.total_bytes = sum(move.size for move in moves)
+        self.workers = workers
+        self.done_files = 0
+        self.done_bytes = 0
+        self.failed = []
+        self.active = {}
+        self.samples = deque()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.interactive = sys.stderr.isatty()
+        self.drawn_lines = 0
+        self.thread = None
+
+    def start(self):
+        if self.interactive:
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join()
+            self._clear()
+
+    def begin(self, slot, move):
+        with self.lock:
+            self.active[slot] = [move, 0]
+
+    def advance(self, slot, amount, sample=True):
+        with self.lock:
+            if slot in self.active:
+                self.active[slot][1] += amount
+            self.done_bytes += amount
+            if sample:
+                self.samples.append((time.monotonic(), amount))
+
+    def finish(self, slot, move, reason=None):
+        with self.lock:
+            self.active.pop(slot, None)
+            self.done_files += 1
+            if reason is not None:
+                self.failed.append(Failure(move, reason))
+        if not self.interactive:
+            status = "ok " if reason is None else "ERRO"
+            line = f"[{self.done_files}/{self.total_files}] {status} {move.source} -> {move.target}"
+            if reason is not None:
+                line += f": {reason}"
+            print(line, file=sys.stderr, flush=True)
+
+    def _speed(self):
+        now = time.monotonic()
+        while self.samples and now - self.samples[0][0] > SPEED_WINDOW:
+            self.samples.popleft()
+        if len(self.samples) < 2:
+            return 0.0
+        span = now - self.samples[0][0]
+        if span <= 0:
+            return 0.0
+        return sum(amount for _, amount in list(self.samples)[1:]) / span
+
+    def _clear(self):
+        if self.drawn_lines:
+            sys.stderr.write(f"\x1b[{self.drawn_lines}A\x1b[0J")
+            sys.stderr.flush()
+            self.drawn_lines = 0
+
+    def _render(self):
+        with self.lock:
+            done_files = self.done_files
+            done_bytes = self.done_bytes
+            active = [(slot, move, moved) for slot, (move, moved) in sorted(self.active.items())]
+            failures = len(self.failed)
+        speed = self._speed()
+        remaining = max(self.total_bytes - done_bytes, 0)
+        eta = remaining / speed if speed > 0 else None
+        header = (
+            f"qmv  {done_files}/{self.total_files} arquivos"
+            f" · {human_bytes(done_bytes)}/{human_bytes(self.total_bytes)}"
+            f" · {human_bytes(int(speed))}/s"
+            f" · ETA {human_time(eta)}"
+        )
+        if failures:
+            header += f" · {failures} falha(s)"
+        lines = [header]
+        for slot, move, moved in active:
+            ratio = moved / move.size if move.size else 1.0
+            ratio = min(max(ratio, 0.0), 1.0)
+            filled = int(ratio * 17)
+            bar = "█" * filled + "░" * (17 - filled)
+            lines.append(
+                f" [{slot + 1}] {shorten(move.source.name, 24)} {bar}"
+                f" {ratio * 100:3.0f}%  {human_bytes(moved)}/{human_bytes(move.size)}"
+            )
+        self._clear()
+        width = shutil.get_terminal_size((120, 24)).columns
+        sys.stderr.write("".join(line[:width] + "\x1b[0K\n" for line in lines))
+        sys.stderr.flush()
+        self.drawn_lines = len(lines)
+
+    def _loop(self):
+        while not self.stop_event.is_set():
+            self._render()
+            self.stop_event.wait(FRAME_INTERVAL)
+        self._render()
+
+
+GVFS_ROOT = Path(f"/run/user/{os.getuid()}/gvfs")
+GIO_POLL_INTERVAL = 0.2
+
+
+def needs_gio(path):
+    return GVFS_ROOT in path.parents
+
+
+def copy_via_gio(move, on_chunk, cancelled):
+    process = subprocess.Popen(
+        ["gio", "copy", "-T", str(move.source), str(move.target)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    reported = 0
+    while process.poll() is None:
+        if cancelled.is_set():
+            process.terminate()
+            process.wait()
+            raise KeyboardInterrupt
+        try:
+            current = move.target.stat().st_size
+        except OSError:
+            current = reported
+        if current > reported:
+            on_chunk(current - reported)
+            reported = current
+        time.sleep(GIO_POLL_INTERVAL)
+    stderr = process.stderr.read().decode(errors="replace").strip()
+    process.stderr.close()
+    if process.returncode != 0:
+        raise OSError(stderr or f"gio copy falhou (código {process.returncode})")
+    on_chunk(max(move.size - reported, 0))
+
+
+def safely(action):
+    try:
+        action()
+    except OSError:
+        pass
+
+
+RENAME_SUPPORT = {}
+RENAME_SUPPORT_LOCK = threading.Lock()
+
+
+def supports_rename(directory):
+    with RENAME_SUPPORT_LOCK:
+        known = RENAME_SUPPORT.get(directory)
+        if known is not None:
+            return known
+    probe = directory / ".qmv-probe"
+    renamed = directory / ".qmv-probe-renamed"
+    supported = False
+    try:
+        probe.write_bytes(b"")
+        os.replace(probe, renamed)
+        supported = True
+    except OSError:
+        supported = False
+    finally:
+        probe.unlink(missing_ok=True)
+        renamed.unlink(missing_ok=True)
+    with RENAME_SUPPORT_LOCK:
+        RENAME_SUPPORT[directory] = supported
+    return supported
+
+
+def copy_file(move, on_chunk, cancelled):
+    staged = supports_rename(move.target.parent)
+    partial = move.target.with_name(move.target.name + ".part") if staged else move.target
+    try:
+        with open(move.source, "rb") as reader, open(partial, "wb") as writer:
+            while True:
+                if cancelled.is_set():
+                    raise KeyboardInterrupt
+                chunk = reader.read(BLOCK_SIZE)
+                if not chunk:
+                    break
+                writer.write(chunk)
+                on_chunk(len(chunk))
+            writer.flush()
+            safely(lambda: os.fsync(writer.fileno()))
+        safely(lambda: shutil.copystat(move.source, partial))
+        if staged:
+            os.replace(partial, move.target)
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+
+
+def move_one(move, progress, slot, cancelled):
+    progress.begin(slot, move)
+    report = lambda amount: progress.advance(slot, amount)
+    try:
+        move.target.parent.mkdir(parents=True, exist_ok=True)
+        remote = needs_gio(move.target) or needs_gio(move.source)
+        copied = remote
+        if not remote:
+            try:
+                os.replace(move.source, move.target)
+                progress.advance(slot, move.size, sample=False)
+            except OSError as error:
+                if error.errno not in RENAME_FALLBACK_ERRORS:
+                    raise
+                copy_file(move, report, cancelled)
+                copied = True
+        else:
+            copy_via_gio(move, report, cancelled)
+        if copied:
+            if move.target.stat().st_size != move.size:
+                move.target.unlink(missing_ok=True)
+                raise OSError("tamanho divergente (origem intacta)")
+            move.source.unlink()
+    except KeyboardInterrupt:
+        progress.finish(slot, move, "cancelado (origem intacta)")
+        return
+    except OSError as error:
+        progress.finish(slot, move, error.strerror or str(error))
+        return
+    progress.finish(slot, move)
+
+
+def prune_empty_directories(sources):
+    for source in sources:
+        if not source.is_dir() or source.is_symlink():
+            continue
+        for current, directories, files in os.walk(source, topdown=False):
+            path = Path(current)
+            if path == source:
+                continue
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
+
+def print_summary(progress, elapsed):
+    moved = progress.total_files - len(progress.failed)
+    print(
+        f"\nConcluído em {human_time(elapsed)} — {moved} movidos"
+        f" ({human_bytes(progress.done_bytes)}), {len(progress.failed)} falhas"
+    )
+    if progress.failed:
+        print("\nFalhas:")
+        for failure in progress.failed:
+            print(f"  {failure.move.source} → {failure.move.target}: {failure.reason}")
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        prog="qmv", description="Move arquivos enfileirados, com progresso e verificação."
+    )
+    parser.add_argument("paths", nargs="+", metavar="ORIGEM... DESTINO")
+    parser.add_argument("--on", type=int, choices=[1, 2, 3], default=1)
+    parser.add_argument("--dry-run", action="store_true")
+    arguments = parser.parse_args()
+    if len(arguments.paths) < 2:
+        parser.error("informe ao menos uma origem e um destino")
+    return arguments
+
+
+def main():
+    arguments = parse_arguments()
+    destination = Path(arguments.paths[-1])
+    if destination.exists() and not destination.is_dir():
+        raise SystemExit(f"qmv: destino não é um diretório: {destination}")
+    if not arguments.dry_run:
+        destination.mkdir(parents=True, exist_ok=True)
+    destination = destination.resolve()
+
+    sources = resolve_sources(arguments.paths[:-1], destination)
+    moves = build_queue(sources, destination)
+    if not moves:
+        print("qmv: nada a mover", flush=True)
+        return 0
+
+    total = sum(move.size for move in moves)
+    print(
+        f"qmv: {len(moves)} arquivos, {human_bytes(total)} → {destination}"
+        f" (paralelismo: {arguments.on})",
+        flush=True,
+    )
+    if arguments.dry_run:
+        for move in moves:
+            print(f"  {move.source} → {move.target}  ({human_bytes(move.size)})")
+        return 0
+
+    cancelled = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: cancelled.set())
+
+    progress = Progress(moves, arguments.on)
+    progress.start()
+    slots = deque(range(arguments.on))
+    slots_lock = threading.Lock()
+    started = time.monotonic()
+
+    def run(move):
+        if cancelled.is_set():
+            progress.finish(0, move, "cancelado (origem intacta)")
+            return
+        with slots_lock:
+            slot = slots.popleft()
+        try:
+            move_one(move, progress, slot, cancelled)
+        finally:
+            with slots_lock:
+                slots.append(slot)
+
+    with ThreadPoolExecutor(max_workers=arguments.on) as pool:
+        list(pool.map(run, moves))
+
+    progress.stop()
+    prune_empty_directories(sources)
+    print_summary(progress, time.monotonic() - started)
+    return 1 if progress.failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
